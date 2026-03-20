@@ -111,6 +111,8 @@ const PRESENCE_ONLINE_WINDOW_MS = 90000;
 const PRESENCE_SOCKET_PORT = 4317;
 const PRESENCE_SOCKET_RECONNECT_MS = 2500;
 const APP_STATE_SYNC_DEBOUNCE_MS = 180;
+const INITIAL_STATE_ENDPOINT = '/bootstrap-state';
+const INITIAL_STATE_TIMEOUT_MS = 4500;
 const LIVE_BROADCAST_EXPIRE_MS = 45000;
 const ESPIONAGE_AUTO_REFRESH_MS = 5000;
 const ESPIONAGE_STALE_PRESENCE_MS = 5 * 60 * 1000;
@@ -247,6 +249,11 @@ let appStateSyncTimer = null;
 let pendingSaveDataFlush = false;
 let remoteStateInitialized = false;
 let remoteStateApplying = false;
+let initialServerStatePromise = null;
+let initialServerStateLoaded = false;
+let initialServerStateLoadAttempted = false;
+let loginAttemptInFlight = false;
+let loginButtonIdleLabel = '';
 const SYNC_CLIENT_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const volatileStorage = Object.create(null);
 let storageWarningShown = false;
@@ -2018,6 +2025,94 @@ function isAppStateEffectivelyEmpty(state) {
   const notesLen = Array.isArray(state.notes) ? state.notes.length : 0;
   const annLen = Array.isArray(state.announcements) ? state.announcements.length : 0;
   return usersLen + ticketsLen + logsLen + tasksLen + notesLen + annLen === 0;
+}
+
+function canLoadInitialServerState() {
+  return typeof window !== 'undefined'
+    && typeof fetch === 'function'
+    && (window.location.protocol === 'http:' || window.location.protocol === 'https:');
+}
+
+async function loadInitialServerState() {
+  if (!canLoadInitialServerState()) return false;
+
+  let timeoutId = null;
+  let controller = null;
+  try {
+    if (typeof AbortController === 'function') {
+      controller = new AbortController();
+      timeoutId = setTimeout(() => {
+        try {
+          controller.abort();
+        } catch {
+          // ignore abort failures
+        }
+      }, INITIAL_STATE_TIMEOUT_MS);
+    }
+
+    const response = await fetch(`${INITIAL_STATE_ENDPOINT}?ts=${Date.now()}`, {
+      cache: 'no-store',
+      signal: controller ? controller.signal : undefined
+    });
+    if (!response.ok) return false;
+
+    const payload = await response.json();
+    const remoteState = payload && payload.appState && typeof payload.appState === 'object' && !Array.isArray(payload.appState)
+      ? payload.appState
+      : null;
+    if (!remoteState || isAppStateEffectivelyEmpty(remoteState)) return false;
+
+    const localBefore = collectAppStateForSync();
+    const mergedStateResult = mergeIncomingAppStateWithLocal(remoteState, localBefore);
+    applySyncedAppState(mergedStateResult.state, { render: false });
+    remoteStateInitialized = true;
+    initialServerStateLoaded = true;
+    return true;
+  } catch (error) {
+    console.warn('[bootstrap-state] Falha ao carregar estado inicial do servidor.', error);
+    return false;
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+function ensureInitialServerStateLoaded(options = {}) {
+  if (initialServerStateLoaded) {
+    return Promise.resolve(true);
+  }
+  if (initialServerStatePromise) {
+    return initialServerStatePromise;
+  }
+
+  const forceRetry = Boolean(options.forceRetry);
+  if (initialServerStateLoadAttempted && !forceRetry) {
+    return Promise.resolve(false);
+  }
+
+  initialServerStateLoadAttempted = true;
+  initialServerStatePromise = loadInitialServerState()
+    .catch(() => false)
+    .finally(() => {
+      initialServerStatePromise = null;
+    });
+  return initialServerStatePromise;
+}
+
+function setLoginBusyState(isBusy, label = 'Entrar') {
+  if (!els.loginButton) return;
+  if (!loginButtonIdleLabel) {
+    loginButtonIdleLabel = String(els.loginButton.textContent || 'Entrar');
+  }
+  els.loginButton.disabled = Boolean(isBusy);
+  els.loginButton.textContent = isBusy ? label : loginButtonIdleLabel;
+  if (els.usernameInput) {
+    els.usernameInput.disabled = Boolean(isBusy);
+  }
+  if (els.passwordInput) {
+    els.passwordInput.disabled = Boolean(isBusy);
+  }
 }
 
 function mergeLocalUsersIntoRemoteState(remoteUsersRaw, localUsersRaw) {
@@ -4175,7 +4270,9 @@ function showNotification(message, type = 'info') {
   }, 3400);
 }
 
-function handleLogin() {
+async function handleLogin() {
+  if (loginAttemptInFlight) return;
+
   const username = els.usernameInput.value.trim().toLowerCase();
   const password = els.passwordInput.value;
 
@@ -4184,46 +4281,56 @@ function handleLogin() {
     return;
   }
 
-  const user = users.find((item) => item.username.toLowerCase() === username && item.password === password);
+  loginAttemptInFlight = true;
+  setLoginBusyState(true, 'Sincronizando...');
+  try {
+    await ensureInitialServerStateLoaded({ forceRetry: true });
+    setLoginBusyState(true, 'Entrando...');
 
-  if (!user) {
-    showNotification('Credenciais invalidas.', 'error');
-    return;
+    const user = users.find((item) => item.username.toLowerCase() === username && item.password === password);
+
+    if (!user) {
+      showNotification('Credenciais invalidas.', 'error');
+      return;
+    }
+
+    if (user.status === 'blocked') {
+      showNotification('Este usuario esta bloqueado.', 'error');
+      return;
+    }
+
+    if (settings.maintenanceMode && user.role !== 'superadmin' && user.role !== 'inteligencia') {
+      showNotification(settings.maintenanceMessage || 'Portal em manutencao.', 'warning');
+      return;
+    }
+
+    registerUserAccess(user);
+    saveData();
+
+    session = {
+      username: user.username,
+      role: user.role,
+      loginAt: Number(user.lastLoginAt) || Date.now(),
+      authPassword: password
+    };
+    storageSetItem(STORAGE_KEYS.ui, JSON.stringify({ lastUser: user.username }));
+
+    updateCurrentUserDisplay();
+    els.loginContainer.classList.add('hidden');
+    els.appContainer.classList.remove('hidden');
+
+    renderSidebar();
+    navigate('dashboard');
+    startClock();
+    startPresenceHeartbeat();
+    syncStealthFromStorage();
+    showLiveBroadcastBanner(readLiveBroadcast());
+
+    showNotification(`Bem-vindo, ${user.username}.`, 'success');
+  } finally {
+    loginAttemptInFlight = false;
+    setLoginBusyState(false);
   }
-
-  if (user.status === 'blocked') {
-    showNotification('Este usuario esta bloqueado.', 'error');
-    return;
-  }
-
-  if (settings.maintenanceMode && user.role !== 'superadmin' && user.role !== 'inteligencia') {
-    showNotification(settings.maintenanceMessage || 'Portal em manutencao.', 'warning');
-    return;
-  }
-
-  registerUserAccess(user);
-  saveData();
-
-  session = {
-    username: user.username,
-    role: user.role,
-    loginAt: Number(user.lastLoginAt) || Date.now(),
-    authPassword: password
-  };
-  storageSetItem(STORAGE_KEYS.ui, JSON.stringify({ lastUser: user.username }));
-
-  updateCurrentUserDisplay();
-  els.loginContainer.classList.add('hidden');
-  els.appContainer.classList.remove('hidden');
-
-  renderSidebar();
-  navigate('dashboard');
-  startClock();
-  startPresenceHeartbeat();
-  syncStealthFromStorage();
-  showLiveBroadcastBanner(readLiveBroadcast());
-
-  showNotification(`Bem-vindo, ${user.username}.`, 'success');
 }
 
 function handleLogout() {
@@ -10213,6 +10320,7 @@ function bootstrap() {
   initData();
   bindStaticEvents();
   restoreLastUserHint();
+  ensureInitialServerStateLoaded();
 }
 
 bootstrap();
