@@ -6,6 +6,7 @@ const { WebSocketServer, WebSocket } = require('ws');
 
 const PORT = Number(process.env.PORT || 4317);
 const WS_PATH = '/ws';
+const BOOTSTRAP_STATE_PATH = '/bootstrap-state';
 const ONLINE_WINDOW_MS = Number(process.env.PRESENCE_ONLINE_WINDOW_MS || 35000);
 const CLEANUP_INTERVAL_MS = Number(process.env.PRESENCE_CLEANUP_INTERVAL_MS || 10000);
 const STATE_FILE = process.env.SHARED_STATE_FILE || path.join(__dirname, 'shared-state.json');
@@ -628,6 +629,18 @@ function serveStatic(req, res) {
   } catch {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Bad request');
+    return;
+  }
+
+  if (reqUrl.pathname === BOOTSTRAP_STATE_PATH) {
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store'
+    });
+    res.end(JSON.stringify({
+      appState,
+      generatedAt: Date.now()
+    }));
     return;
   }
 
